@@ -39,13 +39,18 @@
 all() ->
     [
      {group, all_tests_with_prefix},
-     {group, all_tests_without_prefix}
+     {group, all_tests_without_prefix},
+     {group, user_limits_ff}
     ].
 
 groups() ->
     [
      {all_tests_with_prefix, [], all_tests()},
-     {all_tests_without_prefix, [], all_tests()}
+     {all_tests_without_prefix, [], all_tests()},
+     {user_limits_ff, [], [
+        user_limits_list_test,
+        user_limit_set_test
+     ]}
     ].
 
 all_tests() -> [
@@ -176,6 +181,26 @@ finish_init(Group, Config) ->
     Config1 = rabbit_ct_helpers:set_config(Config, NodeConf),
     merge_app_env(Config1).
 
+enable_feature_flag_or_skip(FFName, Group, Config0) ->
+    Config1 = finish_init(Group, Config0),
+    Config2 = start_broker(Config1),
+    Nodes = rabbit_ct_broker_helpers:get_node_configs(
+              Config2, nodename),
+    Ret = rabbit_ct_broker_helpers:rpc(
+            Config2, 0,
+            rabbit_feature_flags,
+            is_supported_remotely,
+            [Nodes, [FFName], 60000]),
+    case Ret of
+        true ->
+            ok = rabbit_ct_broker_helpers:rpc(
+                    Config2, 0, rabbit_feature_flags, enable, [FFName]),
+            Config2;
+        false ->
+            end_per_group(Group, Config2),
+            {skip, rabbit_misc:format("Feature flag '~s' is not supported", [FFName])}
+    end.
+
 init_per_group(all_tests_with_prefix=Group, Config0) ->
     PathConfig = {rabbitmq_management, [{path_prefix, ?PATH_PREFIX}]},
     Config1 = rabbit_ct_helpers:merge_app_env(Config0, PathConfig),
@@ -197,25 +222,10 @@ init_per_group(all_tests_with_prefix=Group, Config0) ->
             end_per_group(Group, Config3),
             {skip, "Quorum queues are unsupported"}
     end;
+init_per_group(user_limits_ff = Group, Config0) ->
+    enable_feature_flag_or_skip(user_limits, Group, Config0);
 init_per_group(Group, Config0) ->
-    Config1 = finish_init(Group, Config0),
-    Config2 = start_broker(Config1),
-    Nodes = rabbit_ct_broker_helpers:get_node_configs(
-              Config2, nodename),
-    Ret = rabbit_ct_broker_helpers:rpc(
-            Config2, 0,
-            rabbit_feature_flags,
-            is_supported_remotely,
-            [Nodes, [quorum_queue], 60000]),
-    case Ret of
-        true ->
-            ok = rabbit_ct_broker_helpers:rpc(
-                    Config2, 0, rabbit_feature_flags, enable, [quorum_queue]),
-            Config2;
-        false ->
-            end_per_group(Group, Config2),
-            {skip, "Quorum queues are unsupported"}
-    end.
+    enable_feature_flag_or_skip(quorum_queue, Group, Config0).
 
 end_per_group(_, Config) ->
     inets:stop(),
@@ -253,9 +263,21 @@ end_per_testcase0(vhost_limits_list_test, Config) ->
     rabbit_ct_broker_helpers:delete_vhost(Config, <<"limit_test_vhost_2">>),
     rabbit_ct_broker_helpers:delete_user(Config, <<"limit_test_vhost_1_user">>),
     rabbit_ct_broker_helpers:delete_user(Config, <<"limit_test_vhost_2_user">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"no_vhost_user">>),
     Config;
 end_per_testcase0(vhost_limit_set_test, Config) ->
     rabbit_ct_broker_helpers:delete_vhost(Config, <<"limit_test_vhost_1">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"limit_test_vhost_1_user">>),
+    Config;
+end_per_testcase0(user_limits_list_test, Config) ->
+    rabbit_ct_broker_helpers:delete_vhost(Config, <<"limit_test_vhost_1">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"limit_test_user_1_user">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"limit_test_user_2_user">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"no_vhost_user">>),
+    Config;
+end_per_testcase0(user_limit_set_test, Config) ->
+    rabbit_ct_broker_helpers:delete_vhost(Config, <<"limit_test_vhost_1">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"limit_test_user_1_user">>),
     rabbit_ct_broker_helpers:delete_user(Config, <<"limit_test_vhost_1_user">>),
     Config;
 end_per_testcase0(permissions_vhost_test, Config) ->
@@ -2327,8 +2349,8 @@ samples_range_test(Config) ->
 
     ConnDetails = maps:get(connection_details, ConnInfo),
     ConnName0 = maps:get(name, ConnDetails),
-    ConnName = http_uri:encode(binary_to_list(ConnName0)),
-    ChanName = ConnName ++ http_uri:encode(" (1)"),
+    ConnName = uri_string:recompose(#{path => binary_to_list(ConnName0)}),
+    ChanName = ConnName ++ uri_string:recompose(#{path => " (1)"}),
 
     http_get(Config, "/channels/" ++ ChanName ++ "?lengths_age=60&lengths_incr=1", ?OK),
     http_get(Config, "/channels/" ++ ChanName ++ "?lengths_age=6000&lengths_incr=1", ?BAD_REQUEST),
@@ -3081,6 +3103,170 @@ vhost_limit_set_test(Config) ->
 
     %% Unknown limit error
     http_put(Config, "/vhost-limits/limit_test_vhost_1/max-channels", [{value, 200}], ?BAD_REQUEST).
+
+user_limits_list_test(Config) ->
+    ?assertEqual([], http_get(Config, "/user-limits", ?OK)),
+
+    Vhost1 = <<"limit_test_vhost_1">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, <<"limit_test_vhost_1">>),
+
+    http_get(Config, "/user-limits/limit_test_user_1", ?NOT_FOUND),
+
+    User1 = <<"limit_test_user_1">>,
+    rabbit_ct_broker_helpers:add_user(Config, User1),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User1, [management]),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User1, Vhost1),
+
+    ?assertEqual([], http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+    http_get(Config, "/user-limits/limit_test_user_2", ?NOT_FOUND),
+
+    User2 = <<"limit_test_user_2">>,
+    rabbit_ct_broker_helpers:add_user(Config, User2),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User2, [management]),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User2, Vhost1),
+
+    ?assertEqual([], http_get(Config, "/user-limits/limit_test_user_2", ?OK)),
+
+    Limits1 = [
+        #{
+            user => User1,
+            value => #{
+                'max-connections' => 100,
+                'max-channels' => 100
+            }
+        }],
+    Limits2 = [
+        #{
+            user => User2,
+            value => #{
+                'max-connections' => 200
+            }
+        }],
+
+    Expected = Limits1 ++ Limits2,
+
+    lists:map(
+        fun(#{user := Username, value := Val}) ->
+            rabbit_ct_broker_helpers:set_user_limits(Config, 0, Username, Val)
+        end,
+        Expected),
+
+    rabbit_ct_helpers:await_condition(
+        fun() ->
+            Expected =:= http_get(Config, "/user-limits", ?OK)
+        end),
+    Limits1 = http_get(Config, "/user-limits/limit_test_user_1", ?OK),
+    Limits2 = http_get(Config, "/user-limits/limit_test_user_2", ?OK),
+
+    %% Clear limits and assert
+    rabbit_ct_broker_helpers:clear_user_limits(Config, 0, User1,
+        <<"max-connections">>),
+
+    Limits3 = [#{user => User1, value => #{'max-channels' => 100}}],
+    ?assertEqual(Limits3, http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+
+    rabbit_ct_broker_helpers:clear_user_limits(Config, 0, User1,
+        <<"max-channels">>),
+    ?assertEqual([], http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+
+    rabbit_ct_broker_helpers:clear_user_limits(Config, 0, <<"limit_test_user_2">>,
+        <<"all">>),
+    ?assertEqual([], http_get(Config, "/user-limits/limit_test_user_2", ?OK)),
+
+    %% Limit user with no vhost
+    NoVhostUser = <<"no_vhost_user">>,
+    rabbit_ct_broker_helpers:add_user(Config, NoVhostUser),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, NoVhostUser, [management]),
+
+    Limits4 = #{
+        user  => NoVhostUser,
+        value => #{
+            'max-connections' => 150,
+            'max-channels' => 150
+        }
+    },
+    rabbit_ct_broker_helpers:set_user_limits(Config, 0, NoVhostUser, maps:get(value, Limits4)),
+
+    ?assertEqual([Limits4], http_get(Config, "/user-limits/no_vhost_user", ?OK)).
+
+user_limit_set_test(Config) ->
+    ?assertEqual([], http_get(Config, "/user-limits", ?OK)),
+
+    User1 = <<"limit_test_user_1">>,
+    rabbit_ct_broker_helpers:add_user(Config, User1),
+
+    ?assertEqual([], http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+
+    %% Set a user limit
+    http_put(Config, "/user-limits/limit_test_user_1/max-channels", [{value, 100}], ?NO_CONTENT),
+
+    MaxChannelsLimit = [#{user => User1, value => #{'max-channels' => 100}}],
+    ?assertEqual(MaxChannelsLimit, http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+
+    %% Set another user limit
+    http_put(Config, "/user-limits/limit_test_user_1/max-connections", [{value, 200}], ?NO_CONTENT),
+
+    MaxConnectionsAndChannelsLimit = [
+        #{
+            user => User1,
+            value => #{
+                'max-connections' => 200,
+                'max-channels'    => 100
+            }
+        }
+    ],
+    ?assertEqual(MaxConnectionsAndChannelsLimit, http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+
+    Limits1 = [
+        #{
+            user => User1,
+            value => #{
+                'max-connections' => 200,
+                'max-channels'    => 100
+            }
+        }],
+    ?assertEqual(Limits1, http_get(Config, "/user-limits", ?OK)),
+
+    %% Update a user limit
+    http_put(Config, "/user-limits/limit_test_user_1/max-connections", [{value, 1000}], ?NO_CONTENT),
+    Limits2 = [
+        #{
+            user => User1,
+            value => #{
+              'max-connections' => 1000,
+              'max-channels' => 100
+            }
+        }],
+    ?assertEqual(Limits2, http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+
+    Vhost1 = <<"limit_test_vhost_1">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, Vhost1),
+
+    Vhost1User = <<"limit_test_vhost_1_user">>,
+    rabbit_ct_broker_helpers:add_user(Config, Vhost1User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, Vhost1User, [management]),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, Vhost1User, Vhost1),
+
+    Limits3 = [
+        #{
+            user => User1,
+            value => #{
+                'max-connections' => 1000,
+                'max-channels'    => 100
+            }
+        }],
+    ?assertEqual(Limits3, http_get(Config, "/user-limits/limit_test_user_1", Vhost1User, Vhost1User, ?OK)),
+
+    %% Clear a limit
+    http_delete(Config, "/user-limits/limit_test_user_1/max-connections", ?NO_CONTENT),
+    Limits4 = [#{user => User1, value => #{'max-channels' => 100}}],
+    ?assertEqual(Limits4, http_get(Config, "/user-limits/limit_test_user_1", ?OK)),
+
+    %% Only admin can clear limits
+    http_delete(Config, "/user-limits/limit_test_user_1/max-channels", Vhost1User, Vhost1User, ?NOT_AUTHORISED),
+
+    %% Unknown limit error
+    http_put(Config, "/user-limits/limit_test_user_1/max-unknown", [{value, 200}], ?BAD_REQUEST).
 
 rates_test(Config) ->
     http_put(Config, "/queues/%2F/myqueue", none, {group, '2xx'}),
